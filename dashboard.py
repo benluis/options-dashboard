@@ -1,6 +1,7 @@
 # built-in
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, List
 from unittest.mock import MagicMock
@@ -44,6 +45,42 @@ logger.info("Application starting... Logging enabled.")
 # --- INLINED BACKEND SERVICES ---
 # All backend logic is now directly in this file for single-file deployment
 
+# Rate limiting and retry utilities
+def rate_limited_call(func, *args, max_retries=3, base_delay=1.0, **kwargs):
+    """
+    Wrapper function to add retry logic with exponential backoff for API calls.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_str = str(e).lower()
+            error_type = type(e).__name__.lower()
+            
+            # Check if it's a rate limit error (various formats)
+            is_rate_limit = (
+                "rate limit" in error_str or 
+                "too many requests" in error_str or 
+                "429" in error_str or
+                "rate limited" in error_str or
+                "throttled" in error_str or
+                "http 429" in error_str or
+                error_type == "httperror" and "429" in error_str
+            )
+            
+            if is_rate_limit:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Rate limited. Retrying in {delay:.1f} seconds... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    raise Exception(f"Rate limited after {max_retries} attempts. Please wait a moment and try again.")
+            else:
+                # For non-rate-limit errors, raise immediately
+                raise
+    return None
+
 def get_ticker_data(ticker_symbol: str) -> yf.Ticker:
     """Creates a yfinance Ticker object for the given symbol."""
     return yf.Ticker(ticker_symbol)
@@ -60,7 +97,11 @@ def clean_options_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_options_chain(ticker: yf.Ticker) -> dict:
     """Fetches and cleans options chains for all available expiration dates."""
-    expirations = ticker.options
+    # Rate-limited call to get expirations
+    expirations = rate_limited_call(lambda: ticker.options)
+    if not expirations:
+        return {}
+    
     chain = {}
     
     class OptionChain:
@@ -68,12 +109,18 @@ def get_options_chain(ticker: yf.Ticker) -> dict:
             self.calls = calls
             self.puts = puts
     
-    for expiration in expirations:
+    # Add delay between expiration fetches to avoid rate limiting
+    for i, expiration in enumerate(expirations):
         try:
-            options = ticker.option_chain(expiration)
-            cleaned_calls = clean_options_data(options.calls)
-            cleaned_puts = clean_options_data(options.puts)
-            chain[expiration] = OptionChain(cleaned_calls, cleaned_puts)
+            # Add small delay between requests (except for first one)
+            if i > 0:
+                time.sleep(0.2)  # 200ms delay between option chain fetches
+            
+            options = rate_limited_call(ticker.option_chain, expiration)
+            if options:
+                cleaned_calls = clean_options_data(options.calls)
+                cleaned_puts = clean_options_data(options.puts)
+                chain[expiration] = OptionChain(cleaned_calls, cleaned_puts)
         except Exception as e:
             logger.warning(f"Error fetching chain for {expiration}: {e}")
             continue
@@ -205,15 +252,19 @@ def prepare_volatility_surface_data(options_chain: dict, underlying_price: Optio
         "greeks": greeks_data
     }
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_volatility_surface_data(ticker_symbol: str) -> dict:
-    """Fetches volatility surface data directly."""
+    """Fetches volatility surface data directly with caching."""
     ticker = get_ticker_data(ticker_symbol)
     try:
-        hist = ticker.history(period="1d")
-        current_price = hist['Close'].iloc[-1] if not hist.empty else None
-    except:
+        hist = rate_limited_call(ticker.history, period="1d")
+        current_price = hist['Close'].iloc[-1] if hist is not None and not hist.empty else None
+    except Exception as e:
+        logger.warning(f"Error fetching current price: {e}")
         current_price = None
-        
+    
+    # Add delay before fetching options chain
+    time.sleep(0.5)
     options_chain = get_options_chain(ticker)
     surface_data = prepare_volatility_surface_data(options_chain, current_price)
     
@@ -222,15 +273,18 @@ def get_volatility_surface_data(ticker_symbol: str) -> dict:
     
     return surface_data
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_open_interest_data(ticker_symbol: str, expiration_date: Optional[str] = None) -> dict:
-    """Fetches open interest data directly."""
+    """Fetches open interest data directly with caching."""
     ticker = get_ticker_data(ticker_symbol)
-    expirations = ticker.options
+    expirations = rate_limited_call(lambda: ticker.options)
     if not expirations:
         raise Exception("No options expirations found for this ticker")
     
     target_expiration = expiration_date if expiration_date in expirations else expirations[0]
-    options = ticker.option_chain(target_expiration)
+    # Add small delay before fetching option chain
+    time.sleep(0.3)
+    options = rate_limited_call(ticker.option_chain, target_expiration)
     
     calls = options.calls[['strike', 'openInterest', 'volume', 'impliedVolatility']].rename(
         columns={'openInterest': 'callOpenInterest', 'volume': 'callVolume'}
@@ -259,12 +313,13 @@ def get_open_interest_data(ticker_symbol: str, expiration_date: Optional[str] = 
     
     return {"data": merged_data.to_dict(orient='records'), "summary": summary}
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_historical_price_data(ticker_symbol: str) -> dict:
-    """Fetches historical price data directly."""
+    """Fetches historical price data directly with caching."""
     ticker = get_ticker_data(ticker_symbol)
-    hist_data = ticker.history(period="90d")
+    hist_data = rate_limited_call(ticker.history, period="90d")
     
-    if hist_data.empty:
+    if hist_data is None or hist_data.empty:
         raise Exception("Could not fetch historical price data")
         
     hist_data = hist_data[['Close']].reset_index()
@@ -622,11 +677,17 @@ if analyze_btn:
             # Fetch Volatility Surface & Greeks (direct function call)
             st.session_state['data'] = get_volatility_surface_data(ticker)
             
+            # Add delay between API calls to avoid rate limiting
+            time.sleep(0.5)
+            
             # Fetch Open Interest & Summary (direct function call)
             oi_json = get_open_interest_data(ticker)
             st.session_state['oi_data'] = pd.DataFrame(oi_json['data'])
             st.session_state['summary'] = oi_json.get('summary')
 
+            # Add delay before SPY fetch
+            time.sleep(0.5)
+            
             # Always fetch SPY comparison data
             try:
                 spy_json = get_open_interest_data("SPY")
@@ -635,6 +696,9 @@ if analyze_btn:
                 logger.warning(f"Failed to fetch SPY data: {e}")
                 st.session_state['spy_summary'] = None
 
+            # Add delay before historical data fetch
+            time.sleep(0.5)
+            
             # Fetch Historical Price Data (direct function call)
             hist_json = get_historical_price_data(ticker)
             st.session_state['historical_price'] = pd.DataFrame(hist_json.get('data', hist_json))
@@ -646,7 +710,11 @@ if analyze_btn:
                 del st.session_state["selected_date_from_chart"]
                 
         except Exception as e:
-            st.error(f"Error fetching data: {e}")
+            error_msg = str(e)
+            if "rate limit" in error_msg.lower() or "too many requests" in error_msg.lower():
+                st.error(f"Rate limited by data provider. Please wait a moment and try again. Error: {e}")
+            else:
+                st.error(f"Error fetching data: {e}")
             logger.error(f"Error details: {e}", exc_info=True)
 
 # --- MAIN CONTENT ---
